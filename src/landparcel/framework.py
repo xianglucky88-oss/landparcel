@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import uuid
 
 from lxml import html as _lh
 
 from .config import SPEC
 from .store import Store
+from . import identity
 
 
 # --------------------------------------------------------------------------- #
@@ -17,7 +19,6 @@ class Transport:
     """Client for the bundled local service."""
 
     def __init__(self):
-        import os
         import sys
         for p in (str(SPEC_ROOT()), str(SPEC_ROOT() / "src")):
             if p not in sys.path:
@@ -174,6 +175,75 @@ def _apply_kernel(records):
 
 
 # --------------------------------------------------------------------------- #
+# Parcel identity orchestration.
+# --------------------------------------------------------------------------- #
+def resolve_identity(store: Store, incoming, mode: str):
+    """Recompute the identity graph over every known record.
+
+    The graph is always rebuilt from the *full* record set (stored rows plus
+    the new batch), which makes historical replay independent of how the data
+    originally arrived.  Manual decisions are loaded first and always win.
+    Returns the annotated incoming batch plus an audit summary.
+    """
+    run_id = "run_" + uuid.uuid4().hex[:16]
+    started = identity.utc_now_iso()
+    store.start_run(run_id, mode, started)
+    try:
+        history = [identity.strip_annotations(r) for r in store.all_records()]
+        combined = history + [identity.strip_annotations(dict(r))
+                              for r in incoming]
+        graph = identity.build_identity(combined, store.load_decisions())
+
+        ts = identity.utc_now_iso()
+        with store.transaction():
+            for ent in graph["entities"]:
+                store.upsert_entity(ent, ts)
+            member_rows: dict[str, list[tuple[str, str]]] = {}
+            for ent_id, h, ev in graph["members"]:
+                member_rows.setdefault(ent_id, []).append((h, ev))
+            for ent_id, rows in member_rows.items():
+                store.replace_members(ent_id, rows)
+            for rel in graph["relations"]:
+                store.upsert_relation(rel, ts)
+
+        by_hash = {identity.identity_hash(identity.strip_annotations(r)): r
+                   for r in graph["annotated"]}
+        incoming_hashes = {
+            identity.identity_hash(identity.strip_annotations(r))
+            for r in incoming}
+        annotated = [by_hash[h] for h in incoming_hashes if h in by_hash]
+        state_counts = {identity.STATE_CANDIDATE: 0,
+                        identity.STATE_CONFLICT: 0,
+                        identity.STATE_CONFIRMED: 0,
+                        identity.STATE_REJECTED: 0}
+        for rel in graph["relations"]:
+            state_counts[graph["decided"].get(rel["relation_id"],
+                                              rel["state"])] += 1
+        store.finish_run(run_id, "ok", graph["fingerprint"],
+                         len(graph["annotated"]), len(graph["relations"]),
+                         identity.utc_now_iso())
+        summary = {
+            "run_id": run_id,
+            "rule_version": graph["rule_version"],
+            "fingerprint": graph["fingerprint"],
+            # Totals describe the full rebuilt graph (replay-safe); the
+            # incoming-only counters describe what this batch contributed.
+            "entities": len(graph["entities"]),
+            "relations": len(graph["relations"]),
+            "candidates": state_counts[identity.STATE_CANDIDATE],
+            "conflicts": state_counts[identity.STATE_CONFLICT],
+            "confirmed": state_counts[identity.STATE_CONFIRMED],
+            "rejected": state_counts[identity.STATE_REJECTED],
+            "incoming_records": len(incoming_hashes),
+        }
+        return annotated, summary
+    except Exception as exc:  # partial failure must be visible, not silent
+        store.finish_run(run_id, "failed", None, 0, 0,
+                         identity.utc_now_iso(), error=repr(exc))
+        raise
+
+
+# --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
 def run(mode="full", con=None):
@@ -189,10 +259,15 @@ def run(mode="full", con=None):
         norm = _apply_kernel(norm)
 
         wm = store.watermark()
+        incoming = norm
         if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
+            incoming = [r for r in norm if str(r.get("ts", "")) > wm]
 
-        ingested = sum(1 for r in norm if store.upsert(r))
+        # Identity is resolved over the full history before persistence, so a
+        # partial failure during the write rolls the graph back atomically.
+        annotated, id_summary = resolve_identity(store, incoming, mode)
+        with store.transaction():
+            ingested = sum(1 for r in annotated if store.upsert(r))
         total = store.count()
         new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
         if new_wm:
@@ -200,7 +275,7 @@ def run(mode="full", con=None):
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
                 "duplicates": dup_in_batch, "ingested": ingested, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "watermark": store.watermark(), "identity": id_summary}
     finally:
         if own:
             con.close()
@@ -284,15 +359,17 @@ def run_rpa(con=None):
         norm = [normalize(dict(it)) for it in items]
         norm, dup = dedup(norm)
         norm = _apply_kernel(norm)
-        ingested = sum(1 for x in norm if store.upsert(x))
+        annotated, id_summary = resolve_identity(store, norm, "full")
+        with store.transaction():
+            ingested = sum(1 for x in annotated if store.upsert(x))
         total = store.count()
         created = dedup_submit = 0
-        for x in norm[:2]:
+        for x in annotated[:2]:
             if r.submit(x):
                 created += 1
             else:
                 dedup_submit += 1
-        for x in norm[:1]:
+        for x in annotated[:1]:
             if not r.submit(x):
                 dedup_submit += 1
         wm = max([str(x.get("ts", "")) for x in norm] + [""])
@@ -301,7 +378,8 @@ def run_rpa(con=None):
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
                 "ingested": ingested, "count": total,
-                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
+                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log,
+                "identity": id_summary}
     finally:
         if own:
             con.close()
